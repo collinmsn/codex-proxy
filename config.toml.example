@@ -1,0 +1,12 @@
+# Codex 配置文件模板
+# 将此文件复制到 ~/.codex/config.toml
+
+model = "gpt-5.4"
+model_provider = "deepseek"
+sandbox_mode = "danger-full-access"
+
+[model_providers.deepseek]
+name = "DeepSeek"
+base_url = "http://localhost:9090/v1"
+env_key = "DEEPSEEK_API_KEY"
+wire_api = "responses"
