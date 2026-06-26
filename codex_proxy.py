@@ -298,7 +298,13 @@ def _stream(cc, headers, model):
             has_content = False
             final_usage = {}
 
-            for line in r.iter_lines(decode_unicode=True):
+            for line_bytes in r.iter_lines(decode_unicode=False):
+                if not line_bytes:
+                    continue
+                try:
+                    line = line_bytes.decode('utf-8')
+                except UnicodeDecodeError:
+                    continue
                 if not line or not line.startswith("data: "):
                     continue
                 payload = line[6:]
