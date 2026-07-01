@@ -22,6 +22,7 @@ import uuid
 import logging
 import hashlib
 import argparse
+import threading
 import traceback
 from dataclasses import dataclass, field
 
@@ -44,6 +45,7 @@ class ProxyConfig:
     timeout: int = 120
     host: str = "127.0.0.1"
     port: int = 9090
+    rate_limit_rpm: int = 30  # max upstream requests per minute (0 disables)
     default_model: str = "glm-5.1"          # used when request body omits "model"
     fallback_model: str = "deepseek-v4-pro"  # used when an unknown gpt-* is requested
     model_map: dict = field(default_factory=lambda: {
@@ -131,6 +133,47 @@ class ReasoningStore:
 
     def lookup_by_tc(self, tc_id):
         return self._data.get(f"tc_{tc_id}", "")
+
+
+# ------------------------------------------------------------------
+# Rate limiter (leaky bucket / min-interval, blocking)
+# ------------------------------------------------------------------
+
+class RateLimiter:
+    """Thread-safe leaky-bucket limiter that paces requests evenly.
+
+    A plain sliding window allows bursts (e.g. 40 requests in 1s), which trips
+    upstream token buckets that have a small burst capacity. Codex fires multiple
+    tool-call requests concurrently, so we instead enforce a *minimum interval*
+    of 60/rpm seconds between consecutive upstream calls. Concurrent callers
+    queue up and are released one at a time at a steady rate.
+    """
+
+    def __init__(self, rpm):
+        self.rpm = rpm
+        self.interval = 60.0 / rpm if rpm > 0 else 0.0
+        self._lock = threading.Lock()
+        self._next_at = 0.0  # earliest monotonic time the next request may go
+
+    def acquire(self):
+        if self.rpm <= 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            if now >= self._next_at:
+                # Slot is free now; claim it and reserve the next slot.
+                self._next_at = now + self.interval
+                return
+            # Reserve our slot and compute how long to wait for it.
+            wait = self._next_at - now
+            self._next_at += self.interval
+        log.info("RATE LIMIT: pacing, waiting %.2fs (interval=%.2fs)",
+                 wait, self.interval)
+        time.sleep(wait)
+
+
+def _limiter() -> "RateLimiter":
+    return current_app.config["LIMITER"]
 
 
 # ------------------------------------------------------------------
@@ -240,7 +283,7 @@ def _convert_input(body, store):
                 messages.append(msg)
 
     _emit_pending()
-    _emit_tc()
+
     return messages
 
 
@@ -276,6 +319,7 @@ def _build_cc_payload(body, cfg, store):
         if k in body:
             cc[k] = body[k]
     return cc, model
+
 
 
 # ------------------------------------------------------------------
@@ -425,6 +469,7 @@ class ChunkResult:
 def _iter_upstream_chunks(r):
     """Yield parsed SSE chunk dicts from the upstream response.
 
+
     Uses byte-level iteration + manual utf-8 decode so multi-byte characters split
     across chunks don't raise; stops at [DONE]."""
     for line_bytes in r.iter_lines(decode_unicode=False):
@@ -469,6 +514,7 @@ def _parse_chunk_into_state(chunk, state):
         state.full_text += content
         result.content_delta = content
 
+
     tc_delta = delta.get("tool_calls")
     if tc_delta:
         result.has_tool_calls = True
@@ -499,7 +545,6 @@ def _emit_response_created_only(state):
     yield _sse("response.created", _ev_response_created(state.resp_id, state.created, state.model))
 
 
-
 def _build_final_output(state):
     final_output = [_message_output_item(state.msg_id, state.full_text)]
     for idx in sorted(state.tool_calls_acc):
@@ -515,6 +560,7 @@ def _stream(cc, headers, model, cfg, store):
     # Open the upstream connection BEFORE returning the streaming Response, so that
     # upstream errors (e.g. 429) surface with the correct HTTP status instead of a
     # 200 + inline SSE error (which breaks the client's backoff and loops forever).
+    _limiter().acquire()
     try:
         r = http_requests.post(
             f"{cfg.upstream_base}/chat/completions",
@@ -656,6 +702,7 @@ def handle():
     if cc["stream"]:
         return _stream(cc, headers, model, cfg, store)
 
+    _limiter().acquire()
     try:
         r = http_requests.post(f"{cfg.upstream_base}/chat/completions",
                                json=cc, headers=headers, timeout=cfg.timeout)
@@ -665,6 +712,7 @@ def handle():
     if r.status_code >= 400:
         body, status, hdrs = _build_upstream_error(r)
         return jsonify(body), status, hdrs
+
 
     try:
         return jsonify(_cc_to_responses(r.json(), model, store))
@@ -690,6 +738,7 @@ def create_app(cfg):
     logging.basicConfig(filename=cfg.log_path, level=logging.DEBUG, format="%(asctime)s %(message)s")
     app.config["CFG"] = cfg
     app.config["STORE"] = ReasoningStore(cfg.reasoning_store_path)
+    app.config["LIMITER"] = RateLimiter(cfg.rate_limit_rpm)
     return app
 
 
@@ -699,10 +748,13 @@ if __name__ == "__main__":
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--upstream", default="https://integrate.api.nvidia.com/v1",
                    help="Upstream Chat Completions API base URL")
+    p.add_argument("--rate-limit", type=int, default=5,
+                   help="Max upstream requests per minute (0 disables rate limiting)")
     a = p.parse_args()
-    cfg = ProxyConfig(upstream_base=a.upstream, host=a.host, port=a.port)
+    cfg = ProxyConfig(upstream_base=a.upstream, host=a.host, port=a.port,
+                      rate_limit_rpm=a.rate_limit)
     create_app(cfg)
     store = app.config["STORE"]
     print(f"[proxy] http://{cfg.host}:{cfg.port} -> {cfg.upstream_base} "
-          f"(reasoning_store: {len(store._data)} entries)")
+          f"(reasoning_store: {len(store._data)} entries, rate_limit: {cfg.rate_limit_rpm} rpm)")
     app.run(host=cfg.host, port=cfg.port, threaded=True)
